@@ -1,0 +1,222 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: samba-dc-startup
+  namespace: ad-east
+data:
+  start.sh: |
+    #!/bin/bash
+    set -e
+
+    echo "==> Installing Samba + Kerberos + LDAP packages..."
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+        samba samba-dsdb-modules samba-vfs-modules \
+        krb5-user krb5-kdc krb5-admin-server \
+        winbind libnss-winbind libpam-winbind \
+        libsasl2-modules-gssapi-mit libsasl2-modules \
+        dnsutils net-tools iproute2 ldap-utils
+
+    if [ ! -f /var/lib/samba/private/sam.ldb ]; then
+        echo "==> Provisioning Samba AD DC for realm ${REALM}..."
+        rm -f /etc/samba/smb.conf
+        samba-tool domain provision \
+            --realm="${REALM}" \
+            --domain="${DOMAIN}" \
+            --adminpass="${ADMIN_PASS}" \
+            --dns-backend=SAMBA_INTERNAL \
+            --use-rfc2307 \
+            --server-role=dc \
+            --option="dns forwarder=8.8.8.8" \
+            --option="log level=1"
+
+        echo "==> Patching krb5.conf (rdns=false, explicit KDC)..."
+        cp /var/lib/samba/private/krb5.conf /etc/krb5.conf
+        sed -i '/\[libdefaults\]/a\    rdns = false' /etc/krb5.conf
+        # Replace dns_lookup_kdc = true with false and point KDC to localhost
+        sed -i 's/dns_lookup_kdc = true/dns_lookup_kdc = false/' /etc/krb5.conf
+        # Ensure KDC points to 127.0.0.1
+        sed -i "s|kdc =.*|kdc = 127.0.0.1|g" /etc/krb5.conf
+        sed -i "s|admin_server =.*|admin_server = 127.0.0.1|g" /etc/krb5.conf
+
+        echo "==> Registering K8s service DNS SPN (${SVC_FQDN})..."
+        # Allow samba to finish initialising before spn operations
+        sleep 3
+        samba-tool spn add "ldap/dc1.${SVC_FQDN}" "DC1\$" 2>&1 || true
+        samba-tool spn add "host/dc1.${SVC_FQDN}" "DC1\$" 2>&1 || true
+
+        echo "==> Creating sssd-svc service account and exporting keytab..."
+        samba-tool user create sssd-svc "${SSSD_SVC_PASS}" \
+            --description="SSSD GSSAPI service account" 2>&1 || echo "sssd-svc already exists"
+        samba-tool domain exportkeytab /tmp/sssd.keytab \
+            --principal="sssd-svc@${REALM}"
+        chmod 600 /tmp/sssd.keytab
+        echo "    Keytab written to /tmp/sssd.keytab"
+
+        echo "==> Creating test users (manas, tapas, bhavya) and group users_grp..."
+        samba-tool user create manas "${USER_PASS}" 2>&1 || true
+        samba-tool user create tapas "${USER_PASS}" 2>&1 || true
+        samba-tool user create bhavya "${USER_PASS}" 2>&1 || true
+        samba-tool group add users_grp 2>&1 || true
+        samba-tool group addmembers users_grp manas,tapas,bhavya 2>&1 || true
+
+        echo "==> Provisioning complete."
+    else
+        echo "==> Existing provision found, reusing."
+        cp /var/lib/samba/private/krb5.conf /etc/krb5.conf
+        sed -i '/\[libdefaults\]/a\    rdns = false' /etc/krb5.conf
+        sed -i 's/dns_lookup_kdc = true/dns_lookup_kdc = false/' /etc/krb5.conf
+        sed -i "s|kdc =.*|kdc = 127.0.0.1|g" /etc/krb5.conf
+        sed -i "s|admin_server =.*|admin_server = 127.0.0.1|g" /etc/krb5.conf
+    fi
+
+    echo "==> Starting Samba AD DC..."
+    exec samba --no-process-group -d 1
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: samba-dc-secret
+  namespace: ad-east
+type: Opaque
+stringData:
+  ADMIN_PASS: "Admin@East1234!"
+  SSSD_SVC_PASS: "SssdSvc@East1234!"
+  USER_PASS: "User@East1234!"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: samba-ad-dc
+  namespace: ad-east
+  labels:
+    app: samba-ad-dc
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: samba-ad-dc
+  template:
+    metadata:
+      labels:
+        app: samba-ad-dc
+    spec:
+      hostname: dc1
+      subdomain: samba-ad-dc
+      containers:
+        - name: samba-ad-dc
+          image: ubuntu:22.04
+          command: ["/bin/bash", "/startup/start.sh"]
+          env:
+            - name: REALM
+              value: "EAST.LOCAL"
+            - name: DOMAIN
+              value: "EAST"
+            - name: SVC_FQDN
+              value: "samba-ad-dc.ad-east.svc.cluster.local"
+            - name: ADMIN_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: samba-dc-secret
+                  key: ADMIN_PASS
+            - name: SSSD_SVC_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: samba-dc-secret
+                  key: SSSD_SVC_PASS
+            - name: USER_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: samba-dc-secret
+                  key: USER_PASS
+          securityContext:
+            privileged: true
+          ports:
+            - containerPort: 53
+              name: dns-tcp
+              protocol: TCP
+            - containerPort: 53
+              name: dns-udp
+              protocol: UDP
+            - containerPort: 88
+              name: kerberos-tcp
+              protocol: TCP
+            - containerPort: 88
+              name: kerberos-udp
+              protocol: UDP
+            - containerPort: 389
+              name: ldap
+            - containerPort: 636
+              name: ldaps
+            - containerPort: 445
+              name: smb
+            - containerPort: 3268
+              name: gc
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - "samba-tool domain info 127.0.0.1 2>/dev/null | grep -q 'Forest'"
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            failureThreshold: 10
+          volumeMounts:
+            - name: startup
+              mountPath: /startup
+            - name: samba-data
+              mountPath: /var/lib/samba
+            - name: samba-etc
+              mountPath: /etc/samba
+            - name: samba-logs
+              mountPath: /var/log/samba
+      volumes:
+        - name: startup
+          configMap:
+            name: samba-dc-startup
+            defaultMode: 0755
+        - name: samba-data
+          emptyDir: {}
+        - name: samba-etc
+          emptyDir: {}
+        - name: samba-logs
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: samba-ad-dc
+  namespace: ad-east
+spec:
+  selector:
+    app: samba-ad-dc
+  ports:
+    - name: dns-tcp
+      port: 53
+      targetPort: 53
+      protocol: TCP
+    - name: dns-udp
+      port: 53
+      targetPort: 53
+      protocol: UDP
+    - name: kerberos-tcp
+      port: 88
+      targetPort: 88
+      protocol: TCP
+    - name: kerberos-udp
+      port: 88
+      targetPort: 88
+      protocol: UDP
+    - name: ldap
+      port: 389
+      targetPort: 389
+    - name: ldaps
+      port: 636
+      targetPort: 636
+    - name: smb
+      port: 445
+      targetPort: 445
+    - name: gc
+      port: 3268
+      targetPort: 3268
