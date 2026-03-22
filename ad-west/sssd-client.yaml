@@ -1,0 +1,211 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sssd-config
+  namespace: ad-west
+data:
+  sssd.conf: |
+    [sssd]
+    domains = west.local
+    config_file_version = 2
+    services = nss, pam
+    debug_level = 3
+
+    [domain/west.local]
+    id_provider = ldap
+    auth_provider = krb5
+    chpass_provider = krb5
+    debug_level = 3
+
+    ldap_uri = ldap://samba-ad-dc.ad-west.svc.cluster.local
+    ldap_search_base = dc=west,dc=local
+    ldap_schema = ad
+    ldap_id_mapping = true
+    ldap_referrals = false
+
+    ldap_sasl_mech = GSSAPI
+    ldap_sasl_authid = sssd-svc@WEST.LOCAL
+    ldap_krb5_keytab = /etc/sssd/sssd.keytab
+    ldap_krb5_init_creds = true
+
+    ldap_user_object_class = user
+    ldap_user_name = sAMAccountName
+    ldap_user_home_directory = unixHomeDirectory
+    ldap_user_shell = loginShell
+    ldap_group_object_class = group
+    ldap_group_name = sAMAccountName
+    ldap_group_member = member
+
+    krb5_realm = WEST.LOCAL
+    krb5_server = samba-ad-dc.ad-west.svc.cluster.local
+    krb5_store_password_if_offline = true
+
+    cache_credentials = true
+    enumerate = true
+    use_fully_qualified_names = false
+    fallback_homedir = /home/%u
+    default_shell = /bin/bash
+
+  krb5.conf: |
+    [libdefaults]
+        default_realm = WEST.LOCAL
+        dns_lookup_realm = false
+        dns_lookup_kdc = false
+        rdns = false
+        forwardable = true
+
+    [realms]
+        WEST.LOCAL = {
+            kdc = samba-ad-dc.ad-west.svc.cluster.local
+            admin_server = samba-ad-dc.ad-west.svc.cluster.local
+            default_domain = west.local
+        }
+
+    [domain_realm]
+        .west.local = WEST.LOCAL
+        west.local = WEST.LOCAL
+
+  start.sh: |
+    #!/bin/bash
+    set -e
+
+    echo "==> Blocking service starts during package install..."
+    printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
+    chmod +x /usr/sbin/policy-rc.d
+    ln -sf /bin/true /usr/local/bin/systemctl
+
+    echo "==> Installing SSSD + Kerberos packages..."
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+        sssd-common sssd-ldap sssd-krb5 sssd-tools \
+        libsss-idmap0 libsss-nss-idmap0 libnss-sss libpam-sss \
+        krb5-user ldap-utils \
+        libsasl2-modules-gssapi-mit libsasl2-modules || {
+        echo "Fixing partially configured packages..."
+        DEBIAN_FRONTEND=noninteractive dpkg --configure -a 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -f -qq 2>&1 || true
+    }
+
+    rm -f /usr/sbin/policy-rc.d /usr/local/bin/systemctl
+
+    echo "==> Configs mounted from ConfigMap:"
+    echo "--- /etc/sssd/sssd.conf ---"
+    cat /etc/sssd/sssd.conf
+    echo "--- /etc/krb5.conf ---"
+    cat /etc/krb5.conf
+
+    echo "==> Keytab contents:"
+    klist -k /etc/sssd/sssd.keytab
+
+    echo "==> Testing Kerberos authentication via keytab..."
+    kinit -k -t /etc/sssd/sssd.keytab sssd-svc@WEST.LOCAL
+    klist
+    kdestroy
+    echo "    Kerberos OK"
+
+    echo "==> Available SASL mechanisms on DC:"
+    ldapsearch -H ldap://samba-ad-dc.ad-west.svc.cluster.local \
+        -x -b "" -s base -LLL supportedSASLMechanisms 2>&1 || true
+
+    echo "==> Testing ldapsearch with GSSAPI..."
+    kinit -k -t /etc/sssd/sssd.keytab sssd-svc@WEST.LOCAL
+    ldapsearch \
+        -H ldap://samba-ad-dc.ad-west.svc.cluster.local \
+        -Y GSSAPI \
+        -b "DC=west,DC=local" \
+        "(objectClass=user)" sAMAccountName cn 2>&1 \
+        | grep -E "sAMAccountName:|cn:|result:" || true
+    kdestroy
+
+    echo "==> Starting SSSD..."
+    sssd -D --logger=stderr &
+
+    echo ""
+    echo "======================================================"
+    echo " SSSD Client ready — WEST.LOCAL"
+    echo " Auth: GSSAPI Kerberos (keytab: sssd-svc@WEST.LOCAL)"
+    echo " Config: mounted from ConfigMap 'sssd-config'"
+    echo ""
+    echo "   getent passwd          list AD users"
+    echo "   getent group           list AD groups"
+    echo "   id manas               look up user"
+    echo "   sssctl domain-status west.local"
+    echo "======================================================"
+    tail -f /var/log/sssd/sssd_west.local.log 2>/dev/null || \
+        tail -f /var/log/sssd/sssd.log 2>/dev/null || tail -f /dev/null
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sssd-client
+  namespace: ad-west
+  labels:
+    app: sssd-client
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sssd-client
+  template:
+    metadata:
+      labels:
+        app: sssd-client
+    spec:
+      containers:
+        - name: sssd-client
+          image: ubuntu:22.04
+          command: ["/bin/bash", "/startup/start.sh"]
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: startup
+              mountPath: /startup/start.sh
+              subPath: start.sh
+              readOnly: true
+            - name: sssd-conf
+              mountPath: /etc/sssd/sssd.conf
+              subPath: sssd.conf
+              readOnly: true
+            - name: krb5-conf
+              mountPath: /etc/krb5.conf
+              subPath: krb5.conf
+              readOnly: true
+            - name: sssd-keytab
+              mountPath: /etc/sssd/sssd.keytab
+              subPath: sssd.keytab
+              readOnly: true
+            - name: sssd-run
+              mountPath: /var/lib/sss
+            - name: sssd-logs
+              mountPath: /var/log/sssd
+      volumes:
+        - name: startup
+          configMap:
+            name: sssd-config
+            items:
+              - key: start.sh
+                path: start.sh
+            defaultMode: 0755
+        - name: sssd-conf
+          configMap:
+            name: sssd-config
+            items:
+              - key: sssd.conf
+                path: sssd.conf
+            defaultMode: 0600
+        - name: krb5-conf
+          configMap:
+            name: sssd-config
+            items:
+              - key: krb5.conf
+                path: krb5.conf
+            defaultMode: 0644
+        - name: sssd-keytab
+          secret:
+            secretName: sssd-keytab
+            defaultMode: 0600
+        - name: sssd-run
+          emptyDir: {}
+        - name: sssd-logs
+          emptyDir: {}
