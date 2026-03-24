@@ -71,8 +71,65 @@ data:
         sed -i "s|admin_server =.*|admin_server = 127.0.0.1|g" /etc/krb5.conf
     fi
 
-    echo "==> Starting Samba AD DC..."
-    exec samba --no-process-group -d 1
+    echo "==> Starting Samba AD DC (background)..."
+    samba --no-process-group -d 1 &
+    SAMBA_PID=$!
+
+    echo "==> Waiting for Samba to initialize..."
+    until samba-tool domain info 127.0.0.1 >/dev/null 2>&1; do sleep 3; done
+    echo "==> Samba ready."
+
+    # Cross-domain trust with WEST.LOCAL — runs in background, non-blocking
+    (
+        WEST_SVC="samba-ad-dc.ad-west.svc.cluster.local"
+        echo "==> [Trust] Waiting for WEST DC at ${WEST_SVC}..."
+        WEST_IP=""
+        for i in $(seq 1 60); do
+            WEST_IP=$(getent hosts "${WEST_SVC}" 2>/dev/null | awk '{print $1}' | head -1)
+            if [ -n "$WEST_IP" ]; then
+                if ldapsearch -H "ldap://${WEST_SVC}" -x -b "" -s base 2>/dev/null | grep -q namingContexts; then
+                    echo "==> [Trust] WEST DC reachable at ${WEST_IP}"
+                    break
+                fi
+            fi
+            WEST_IP=""
+            sleep 5
+        done
+
+        if [ -z "$WEST_IP" ]; then
+            echo "==> [Trust] Could not reach WEST DC — skipping trust setup."
+            exit 0
+        fi
+
+        # Add west.local DNS zone into EAST's Samba internal DNS
+        echo "==> [Trust] Configuring DNS for west.local -> ${WEST_IP}..."
+        samba-tool dns zonecreate 127.0.0.1 west.local \
+            -U Administrator --password="${ADMIN_PASS}" 2>&1 || true
+        samba-tool dns add 127.0.0.1 west.local dc1 A "${WEST_IP}" \
+            -U Administrator --password="${ADMIN_PASS}" 2>&1 || true
+        samba-tool dns add 127.0.0.1 west.local "@" A "${WEST_IP}" \
+            -U Administrator --password="${ADMIN_PASS}" 2>&1 || true
+        grep -q "dc1.west.local" /etc/hosts 2>/dev/null || \
+            echo "${WEST_IP}  dc1.west.local west.local" >> /etc/hosts
+        sleep 5
+
+        echo "==> [Trust] Creating bidirectional external trust EAST.LOCAL <-> WEST.LOCAL..."
+        samba-tool domain trust create west.local \
+            --type=external \
+            --direction=both \
+            --remote-user=Administrator \
+            --remote-pass="Admin@West1234!" \
+            -U Administrator \
+            --password="${ADMIN_PASS}" 2>&1 \
+            && echo "==> [Trust] Trust established successfully!" \
+            || echo "==> [Trust] Trust creation failed — check DC logs."
+
+        echo "==> [Trust] Trust list:"
+        samba-tool domain trust list 2>&1 || true
+    ) &
+
+    echo "==> AD DC running (PID ${SAMBA_PID}). Waiting..."
+    wait $SAMBA_PID
 ---
 apiVersion: v1
 kind: Secret
