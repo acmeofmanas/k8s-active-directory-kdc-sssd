@@ -57,18 +57,20 @@ wait_for_dc "ad-west"
 
 echo ""
 echo "==> Step 4: Extracting keytabs and creating Secrets..."
-# Each DC's keytab in its own namespace (used by the single-domain SSSD client in ad-west)
+# Each DC's keytab in its own namespace (primary domain)
 extract_keytab "ad-east" "ad-east" "sssd-keytab"
 extract_keytab "ad-west" "ad-west" "sssd-keytab"
 
-# Cross-namespace: west keytab also placed in ad-east for the multi-domain SSSD client
+# Cross-namespace: each DC's keytab also placed in the other namespace
+# ad-east client needs west keytab to query WEST.LOCAL
 extract_keytab "ad-west" "ad-east" "sssd-keytab-west"
+# ad-west client needs east keytab to query EAST.LOCAL
+extract_keytab "ad-east" "ad-west" "sssd-keytab-east"
 
 echo ""
 echo "==> Step 5: Deploying SSSD clients..."
-# ad-east: multi-domain client (syncs EAST.LOCAL + WEST.LOCAL)
+# Both clients are multi-domain (sync EAST.LOCAL + WEST.LOCAL)
 kubectl apply -f "${SCRIPT_DIR}/ad-east/sssd-client.yaml"
-# ad-west: single-domain client (syncs WEST.LOCAL only)
 kubectl apply -f "${SCRIPT_DIR}/ad-west/sssd-client.yaml"
 
 echo ""
@@ -86,7 +88,7 @@ echo "   kubectl exec -n ad-east deploy/sssd-client -- id manas"
 echo "   kubectl exec -n ad-east deploy/sssd-client -- sssctl domain-status east.local"
 echo "   kubectl exec -n ad-east deploy/sssd-client -- sssctl domain-status west.local"
 echo ""
-echo " Single-domain client (ad-west) — syncs WEST only:"
+echo " Multi-domain client (ad-west) — syncs WEST + EAST:"
 echo "   kubectl exec -n ad-west deploy/sssd-client -- getent passwd"
 echo "   kubectl exec -n ad-west deploy/sssd-client -- id manas"
 echo "======================================================"
