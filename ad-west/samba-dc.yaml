@@ -68,8 +68,43 @@ data:
         sed -i "s|admin_server =.*|admin_server = 127.0.0.1|g" /etc/krb5.conf
     fi
 
-    echo "==> Starting Samba AD DC..."
-    exec samba --no-process-group -d 1
+    echo "==> Starting Samba AD DC (background)..."
+    samba --no-process-group -d 1 &
+    SAMBA_PID=$!
+
+    echo "==> Waiting for Samba to initialize..."
+    until samba-tool domain info 127.0.0.1 >/dev/null 2>&1; do sleep 3; done
+    echo "==> Samba ready."
+
+    # Pre-configure DNS for east.local so EAST-initiated trust can resolve WEST
+    (
+        EAST_SVC="samba-ad-dc.ad-east.svc.cluster.local"
+        echo "==> [Trust] Resolving EAST DC at ${EAST_SVC}..."
+        EAST_IP=""
+        for i in $(seq 1 30); do
+            EAST_IP=$(getent hosts "${EAST_SVC}" 2>/dev/null | awk '{print $1}' | head -1)
+            [ -n "$EAST_IP" ] && break
+            sleep 5
+        done
+
+        if [ -n "$EAST_IP" ]; then
+            echo "==> [Trust] Configuring DNS for east.local -> ${EAST_IP}..."
+            grep -q "dc1.east.local" /etc/hosts 2>/dev/null || \
+                echo "${EAST_IP}  dc1.east.local east.local" >> /etc/hosts
+            samba-tool dns zonecreate 127.0.0.1 east.local \
+                -U Administrator --password="${ADMIN_PASS}" 2>&1 || true
+            samba-tool dns add 127.0.0.1 east.local dc1 A "${EAST_IP}" \
+                -U Administrator --password="${ADMIN_PASS}" 2>&1 || true
+            samba-tool dns add 127.0.0.1 east.local "@" A "${EAST_IP}" \
+                -U Administrator --password="${ADMIN_PASS}" 2>&1 || true
+            echo "==> [Trust] DNS for east.local configured. Trust will be initiated by EAST DC."
+        else
+            echo "==> [Trust] Could not resolve EAST DC."
+        fi
+    ) &
+
+    echo "==> AD DC running (PID ${SAMBA_PID}). Waiting..."
+    wait $SAMBA_PID
 ---
 apiVersion: v1
 kind: Secret
